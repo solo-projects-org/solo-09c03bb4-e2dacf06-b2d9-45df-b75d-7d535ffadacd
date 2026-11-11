@@ -5,15 +5,19 @@ import os
 from contextlib import asynccontextmanager
 from datetime import date
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Body, FastAPI, HTTPException, Query
 
-from . import db
+from . import db, mappings
 from .harvester import HarvestConflictError, harvest
 from .oai_client import OAIClient, OAIError
 from .schemas import (
     BibRecordOut,
     HarvestRequest,
     HarvestResponse,
+    IdentifierMappingOut,
+    IdentifierMappingRequest,
+    IdentifierMappingResponse,
+    IdentifierPairIn,
     ProgressResponse,
     RunOut,
 )
@@ -35,7 +39,10 @@ app = FastAPI(
         "通过 OAI-PMH ListRecords(oai_dc) 按日期补采单馆书目。\n\n"
         "- 首次采集另填起始日；之后从上次成功采集的截止日（含当天）续采\n"
         "- 续页只用 resumptionToken；令牌失效则丢弃已取页、按原区间重抓一次\n"
-        "- 整批采完才在一个事务内提交书目变更和截止日，无匹配也推进截止日"
+        "- 整批采完才在一个事务内提交书目变更和截止日，无匹配也推进截止日\n"
+        "- 成员馆换系统时先整批登记新旧标识对照；补采写库时把新号的更新/"
+        "撤下映射回原书目，忽略旧号的记录和删除标记\n"
+        "- 目录仍以旧号列出且只列一条，详情用新旧任一标识均可查询"
     ),
     version="1.0.0",
     lifespan=lifespan,
@@ -94,6 +101,83 @@ def trigger_harvest(req: HarvestRequest) -> HarvestResponse:
     return HarvestResponse(**summary.__dict__)
 
 
+@app.post(
+    "/api/v1/identifier-mappings",
+    response_model=IdentifierMappingResponse,
+    summary="整批登记新旧 OAI 标识对照",
+    tags=["标识对照"],
+)
+@app.post(
+    "/api/v1/mappings",
+    response_model=IdentifierMappingResponse,
+    include_in_schema=False,
+)
+def register_identifier_mappings(
+    payload: IdentifierMappingRequest | list[IdentifierPairIn] = Body(...),
+) -> IdentifierMappingResponse:
+    """登记成员馆换系统后的新旧标识对照。
+
+    - 旧号须在架，新号不能已入库；
+    - 任一标识不能在本批或已登记对照中重复参与换号；
+    - 有冲突会指出标识，整批不登记（单事务原子提交）；
+    - 只写对照表，不改书目内容、状态或采集截止日。
+    """
+    if isinstance(payload, IdentifierMappingRequest):
+        pairs = payload.mappings
+    else:
+        pairs = payload
+    if not pairs:
+        raise HTTPException(status_code=422, detail="对照批次不能为空")
+
+    conn = db.get_connection()
+    try:
+        try:
+            with db.transaction(conn):
+                registered = mappings.register_mappings(
+                    conn,
+                    [
+                        (pair.old_identifier, pair.new_identifier)
+                        for pair in pairs
+                    ],
+                )
+                conn.commit()
+        except mappings.MappingConflictError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "存在冲突，整批未登记",
+                    "conflicts": [c.as_dict() for c in exc.conflicts],
+                },
+            ) from exc
+    finally:
+        conn.close()
+
+    return IdentifierMappingResponse(
+        registered=len(registered),
+        mappings=[IdentifierMappingOut(**item) for item in registered],
+    )
+
+
+@app.get(
+    "/api/v1/identifier-mappings",
+    response_model=list[IdentifierMappingOut],
+    summary="查询已登记的新旧标识对照",
+    tags=["标识对照"],
+)
+@app.get(
+    "/api/v1/mappings",
+    response_model=list[IdentifierMappingOut],
+    include_in_schema=False,
+)
+def list_identifier_mappings() -> list[IdentifierMappingOut]:
+    conn = db.get_connection()
+    try:
+        rows = db.list_identifier_mappings(conn)
+        return [IdentifierMappingOut(**dict(row)) for row in rows]
+    finally:
+        conn.close()
+
+
 @app.get(
     "/api/v1/catalog",
     response_model=list[BibRecordOut],
@@ -143,6 +227,14 @@ def get_record(identifier: str) -> BibRecordOut:
         row = conn.execute(
             "SELECT * FROM bib_records WHERE identifier = ?", (identifier,)
         ).fetchone()
+        if row is None:
+            # 详情允许使用新号查询：按已登记对照回落到原书目（旧号）
+            mapping = db.find_mapping_by_new(conn, identifier)
+            if mapping is not None:
+                row = conn.execute(
+                    "SELECT * FROM bib_records WHERE identifier = ?",
+                    (mapping["old_identifier"],),
+                ).fetchone()
         if row is None:
             raise HTTPException(status_code=404, detail="记录不存在")
         return BibRecordOut(**dict(row))

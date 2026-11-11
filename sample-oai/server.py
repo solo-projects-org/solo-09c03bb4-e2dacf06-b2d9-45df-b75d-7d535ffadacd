@@ -43,7 +43,15 @@ BASE_URL = os.environ.get("BASE_URL", f"http://oai-source:{PORT}/oai")
 
 
 def _build_records() -> list[dict]:
-    """生成 27 条确定性的样例书目，其中 rec-013 为已删除记录。"""
+    """生成 27 条确定性样例书目，其中 rec-013 为已删除记录。
+
+    另追加 rec-001/rec-002 的换系统轨迹（datestamp 均在 11 月）：
+      11-01 旧号发出删除标记；
+      11-02 新号带更新后的书目；
+      11-15 新号发出删除标记。
+    先采入旧号并登记对照后，分批补采可验证：旧号停用不撤下书目，
+    新号被删除时才撤下原书目。
+    """
     records = []
     start = date(2026, 10, 1)
     for i in range(1, 28):
@@ -60,6 +68,39 @@ def _build_records() -> list[dict]:
                 "type": "text",
             }
         )
+
+    for i in (1, 2):
+        old_identifier = f"oai:sample.lib:rec-{i:03d}"
+        new_identifier = f"oai:sample2.lib:rec-{i:03d}"
+        # 旧系统停用：成员馆对旧号发删除标记
+        records.append(
+            {
+                "identifier": old_identifier,
+                "datestamp": "2026-11-01",
+                "deleted": True,
+            }
+        )
+        # 新系统上线：同一书目在新号下继续更新
+        records.append(
+            {
+                "identifier": new_identifier,
+                "datestamp": "2026-11-02",
+                "deleted": False,
+                "title": f"样例书目 {i:03d}：成员馆新系统记录",
+                "creator": f"新系统测试作者 {i:03d}",
+                "date": "2026-11-02",
+                "dc_identifier": f"ISBN 978-7-1000-{i:04d}-X",
+                "type": "text",
+            }
+        )
+        # 新系统的最终删除：此时才撤下原书目
+        records.append(
+            {
+                "identifier": new_identifier,
+                "datestamp": "2026-11-15",
+                "deleted": True,
+            }
+        )
     return records
 
 
@@ -67,19 +108,23 @@ RECORDS = _build_records()
 
 
 class TokenStore:
-    """resumptionToken 的内存存储，带 TTL 与故障注入开关。"""
+    """resumptionToken 的内存存储，带 TTL 与故障注入开关。
+
+    令牌保存的是 RECORDS 下标而非标识，因为同一标识（例如换系统前的
+    旧号）可能在不同日期区间各有一条记录。
+    """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._tokens: dict[str, dict] = {}
         self.fail_next_token = False
 
-    def create(self, *, ids: list[str], cursor: int, from_date: str | None,
-               until_date: str | None) -> str:
+    def create(self, *, indexes: list[int], cursor: int,
+               from_date: str | None, until_date: str | None) -> str:
         token = uuid.uuid4().hex
         with self._lock:
             self._tokens[token] = {
-                "ids": ids,
+                "indexes": indexes,
                 "cursor": cursor,
                 "from": from_date,
                 "until": until_date,
@@ -179,15 +224,22 @@ def _record_element(parent: ET.Element, record: dict) -> None:
         ET.SubElement(dc_el, f"{{{DC_NS}}}{tag}").text = value
 
 
-def _filter_records(from_date: str | None, until_date: str | None) -> list[dict]:
+def _filter_record_indexes(from_date: str | None,
+                           until_date: str | None) -> list[int]:
     result = []
-    for record in RECORDS:
+    for index, record in enumerate(RECORDS):
         if from_date and record["datestamp"] < from_date:
             continue
         if until_date and record["datestamp"] > until_date:
             continue
-        result.append(record)
+        result.append(index)
     return result
+
+
+def _filter_records(from_date: str | None,
+                    until_date: str | None) -> list[dict]:
+    """兼容旧内部用法：按日期区间返回记录本身。"""
+    return [RECORDS[i] for i in _filter_record_indexes(from_date, until_date)]
 
 
 def _parse_date(value: str | None) -> str | None:
@@ -216,7 +268,7 @@ def _list_records(qs: dict) -> bytes:
                 "badResumptionToken",
                 "resumptionToken 已失效或不存在",
             )
-        ids = state["ids"]
+        indexes = state["indexes"]
         cursor = state["cursor"]
         from_date, until_date = state["from"], state["until"]
         echo = {"verb": "ListRecords", "resumptionToken": token_value}
@@ -235,12 +287,11 @@ def _list_records(qs: dict) -> bytes:
             return _error_response(
                 {"verb": "ListRecords"}, "badArgument", "日期参数必须为 YYYY-MM-DD"
             )
-        matched = _filter_records(from_date, until_date)
-        if not matched:
+        indexes = _filter_record_indexes(from_date, until_date)
+        if not indexes:
             return _error_response(
                 {"verb": "ListRecords"}, "noRecordsMatch", "区间内没有匹配记录"
             )
-        ids = [r["identifier"] for r in matched]
         cursor = 0
         echo = {
             "verb": "ListRecords",
@@ -249,15 +300,14 @@ def _list_records(qs: dict) -> bytes:
             "until": until_date,
         }
 
-    by_id = {r["identifier"]: r for r in RECORDS}
-    page_ids = ids[cursor:cursor + PAGE_SIZE]
-    complete = len(ids)
-    next_cursor = cursor + len(page_ids)
+    page_indexes = indexes[cursor:cursor + PAGE_SIZE]
+    complete = len(indexes)
+    next_cursor = cursor + len(page_indexes)
 
     root = _envelope(echo)
     list_el = ET.SubElement(root, f"{{{OAI_NS}}}ListRecords")
-    for identifier in page_ids:
-        _record_element(list_el, by_id[identifier])
+    for index in page_indexes:
+        _record_element(list_el, RECORDS[index])
 
     rt_attrs = {"completeListSize": str(complete), "cursor": str(cursor)}
     rt_el = ET.SubElement(
@@ -265,7 +315,7 @@ def _list_records(qs: dict) -> bytes:
     )
     if next_cursor < complete:
         rt_el.text = TOKENS.create(
-            ids=ids, cursor=next_cursor,
+            indexes=indexes, cursor=next_cursor,
             from_date=from_date, until_date=until_date,
         )
     # 末页输出空 resumptionToken（OAI-PMH 允许），采集端据此结束翻页
@@ -279,7 +329,7 @@ def _list_identifiers(qs: dict) -> bytes:
             {"verb": "ListIdentifiers"}, "cannotDisseminateFormat", "仅支持 oai_dc"
         )
     try:
-        matched = _filter_records(
+        matched_indexes = _filter_record_indexes(
             _parse_date(qs.get("from", [None])[0]),
             _parse_date(qs.get("until", [None])[0]),
         )
@@ -287,13 +337,14 @@ def _list_identifiers(qs: dict) -> bytes:
         return _error_response(
             {"verb": "ListIdentifiers"}, "badArgument", "日期参数必须为 YYYY-MM-DD"
         )
-    if not matched:
+    if not matched_indexes:
         return _error_response(
             {"verb": "ListIdentifiers"}, "noRecordsMatch", "区间内没有匹配记录"
         )
     root = _envelope({"verb": "ListIdentifiers", "metadataPrefix": "oai_dc"})
     list_el = ET.SubElement(root, f"{{{OAI_NS}}}ListIdentifiers")
-    for record in matched:
+    for index in matched_indexes:
+        record = RECORDS[index]
         attrs = {"status": "deleted"} if record["deleted"] else {}
         header = ET.SubElement(list_el, f"{{{OAI_NS}}}header", attrs)
         ET.SubElement(header, f"{{{OAI_NS}}}identifier").text = record["identifier"]
@@ -332,7 +383,9 @@ def _list_metadata_formats() -> bytes:
 
 def _get_record(qs: dict) -> bytes:
     identifier = qs.get("identifier", [None])[0]
-    record = next((r for r in RECORDS if r["identifier"] == identifier), None)
+    matches = [r for r in RECORDS if r["identifier"] == identifier]
+    # 同一标识可能在不同 datestamp 各有一条记录，GetRecord 返回最新一条
+    record = max(matches, key=lambda r: r["datestamp"]) if matches else None
     if record is None or qs.get("metadataPrefix", [None])[0] != "oai_dc":
         return _error_response(
             {"verb": "GetRecord"}, "idDoesNotExist", f"记录不存在：{identifier}"

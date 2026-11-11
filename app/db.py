@@ -1,4 +1,4 @@
-"""SQLite 持久化：书目记录、采集进度、采集运行历史。
+"""SQLite 持久化：书目记录、采集进度、采集运行历史、新旧标识对照。
 
 所有写操作在单连接单事务内完成，保证“整批采完才提交”。
 """
@@ -58,6 +58,17 @@ CREATE TABLE IF NOT EXISTS harvest_runs (
     retries         INTEGER NOT NULL DEFAULT 0,
     error           TEXT
 );
+
+-- 馆方换系统后的新旧 OAI 标识对照。旧号仍是联合目录的主键，
+-- 新号只用于把后续 OAI 更新/删除映射回旧书目。
+CREATE TABLE IF NOT EXISTS identifier_mappings (
+    old_identifier  TEXT PRIMARY KEY,            -- 原书目标识（仍在架）
+    new_identifier  TEXT NOT NULL UNIQUE,        -- 成员馆新系统标识
+    registered_at   TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_identifier_mappings_new
+    ON identifier_mappings (new_identifier);
 """
 
 
@@ -210,3 +221,61 @@ def insert_withdrawn_tombstone(conn: sqlite3.Connection, *, identifier: str,
         """,
         (identifier, datestamp, "{}", utc_now_iso()),
     )
+
+
+def list_identifier_mappings(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """按登记顺序返回全部新旧标识对照。"""
+    return conn.execute(
+        """
+        SELECT old_identifier, new_identifier, registered_at
+        FROM identifier_mappings
+        ORDER BY rowid
+        """
+    ).fetchall()
+
+
+def find_mapping_by_new(conn: sqlite3.Connection,
+                        new_identifier: str) -> sqlite3.Row | None:
+    return conn.execute(
+        """
+        SELECT old_identifier, new_identifier, registered_at
+        FROM identifier_mappings
+        WHERE new_identifier = ?
+        """,
+        (new_identifier,),
+    ).fetchone()
+
+
+def find_mapping_by_identifier(conn: sqlite3.Connection,
+                               identifier: str) -> sqlite3.Row | None:
+    """标识以任一角色（旧号或新号）出现在已登记对照中时返回该对照。"""
+    return conn.execute(
+        """
+        SELECT old_identifier, new_identifier, registered_at
+        FROM identifier_mappings
+        WHERE old_identifier = ? OR new_identifier = ?
+        """,
+        (identifier, identifier),
+    ).fetchone()
+
+
+def insert_identifier_mapping(conn: sqlite3.Connection, *, old_identifier: str,
+                              new_identifier: str,
+                              registered_at: str) -> None:
+    conn.execute(
+        """
+        INSERT INTO identifier_mappings (
+            old_identifier, new_identifier, registered_at
+        ) VALUES (?, ?, ?)
+        """,
+        (old_identifier, new_identifier, registered_at),
+    )
+
+
+def get_bib_status(conn: sqlite3.Connection,
+                   identifier: str) -> str | None:
+    row = conn.execute(
+        "SELECT status FROM bib_records WHERE identifier = ?",
+        (identifier,),
+    ).fetchone()
+    return row["status"] if row else None

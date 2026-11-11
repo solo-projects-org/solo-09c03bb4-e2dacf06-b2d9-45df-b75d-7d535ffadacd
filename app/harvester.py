@@ -7,6 +7,8 @@
 3. resumptionToken 失效（badResumptionToken）时丢弃已取页，按原区间整体重抓一次。
 4. 所有页取完后，在单个 SQLite 事务内 upsert/撤下书目并推进截止日；
    无匹配记录同样推进截止日。事务失败则整批回滚，进度不变。
+5. 写库事务内读取已登记的新旧标识对照：新号的更新/撤下落到原书目（旧号），
+   旧号自身的记录及删除标记忽略。因此翻页早于登记开始也不影响本批写库。
 """
 from __future__ import annotations
 
@@ -39,6 +41,7 @@ class HarvestSummary:
     withdrawn: int
     retries: int
     run_id: int
+    ignored: int = 0
     status: str = "success"
     note: str | None = None
 
@@ -136,27 +139,45 @@ def _harvest_locked(client: OAIClient, *, until_date: str,
                 )
             raise
 
-        # 整批落库：单事务，任何异常整体回滚，半批数据不会入库
+        # 整批落库：单事务，任何异常整体回滚，半批数据不会入库。
+        # 对照在写库事务内读取，因此即使翻页开始于登记之前，只要登记
+        # 已在本事务开始前提交，本批写库就会按最新对照处理。
         with db.transaction(conn):
-            inserted = updated = withdrawn = 0
+            mappings = db.list_identifier_mappings(conn)
+            new_to_old = {
+                m["new_identifier"]: m["old_identifier"] for m in mappings
+            }
+            mapped_old = {m["old_identifier"] for m in mappings}
+
+            inserted = updated = withdrawn = ignored = 0
             for record in records:
+                # 已登记的新号：更新/撤下都落到原书目（旧号）
+                if record.identifier in new_to_old:
+                    target_identifier = new_to_old[record.identifier]
+                # 已登记的旧号：记录本身及其删除标记一律忽略
+                elif record.identifier in mapped_old:
+                    ignored += 1
+                    continue
+                else:
+                    target_identifier = record.identifier
+
                 if record.deleted:
                     # 遇删除标记就撤下；库中不存在则落 withdrawn 墓碑
                     if db.withdraw_bib_record(
-                        conn, identifier=record.identifier,
+                        conn, identifier=target_identifier,
                         datestamp=record.datestamp,
                     ):
                         withdrawn += 1
                     else:
                         db.insert_withdrawn_tombstone(
-                            conn, identifier=record.identifier,
+                            conn, identifier=target_identifier,
                             datestamp=record.datestamp,
                         )
                         withdrawn += 1
                     continue
                 outcome = db.upsert_bib_record(
                     conn,
-                    identifier=record.identifier,
+                    identifier=target_identifier,
                     datestamp=record.datestamp,
                     fields=_first_values(record.dc),
                     raw_dc=json.dumps(record.dc, ensure_ascii=False),
@@ -175,9 +196,9 @@ def _harvest_locked(client: OAIClient, *, until_date: str,
             conn.commit()
 
         logger.info(
-            "采集成功 区间=%s~%s 页=%d 取=%d 增=%d 改=%d 撤=%d 重抓=%d",
+            "采集成功 区间=%s~%s 页=%d 取=%d 增=%d 改=%d 撤=%d 忽略=%d 重抓=%d",
             effective_from, until_date, pages, len(records),
-            inserted, updated, withdrawn, retries,
+            inserted, updated, withdrawn, ignored, retries,
         )
         return HarvestSummary(
             from_date=effective_from or "",
@@ -189,6 +210,7 @@ def _harvest_locked(client: OAIClient, *, until_date: str,
             withdrawn=withdrawn,
             retries=retries,
             run_id=run_id,
+            ignored=ignored,
         )
     except Exception as exc:
         # 失败：确保事务回滚，截止日不推进；另起事务记录失败历史

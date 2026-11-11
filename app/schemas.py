@@ -1,7 +1,7 @@
 """请求/响应模型。"""
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field, field_validator
 
 
 class HarvestRequest(BaseModel):
@@ -33,6 +33,9 @@ class HarvestResponse(BaseModel):
     inserted: int
     updated: int
     withdrawn: int = Field(..., description="因删除标记撤下的记录数")
+    ignored: int = Field(
+        0, description="按已登记对照忽略的旧号记录数（含旧号删除标记）"
+    )
     retries: int = Field(..., description="令牌失效后按原区间重抓的次数（0 或 1）")
     run_id: int
     note: str | None = None
@@ -70,3 +73,57 @@ class RunOut(BaseModel):
     withdrawn: int
     retries: int
     error: str | None
+
+
+class IdentifierPairIn(BaseModel):
+    """一组新旧标识对照。"""
+
+    old_identifier: str = Field(
+        ...,
+        validation_alias=AliasChoices(
+            "old_identifier", "old", "old_id", "oldIdentifier"
+        ),
+        description="原书目标识，登记时必须在架",
+        examples=["oai:sample.lib:rec-001"],
+    )
+    new_identifier: str = Field(
+        ...,
+        validation_alias=AliasChoices(
+            "new_identifier", "new", "new_id", "newIdentifier"
+        ),
+        description="成员馆新系统标识，登记时不得已入库",
+        examples=["oai:sample2.lib:rec-001"],
+    )
+
+    model_config = {"populate_by_name": True}
+
+    @field_validator("old_identifier", "new_identifier")
+    @classmethod
+    def _not_blank(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("标识不能为空")
+        return value
+
+
+class IdentifierMappingRequest(BaseModel):
+    mappings: list[IdentifierPairIn] = Field(
+        ...,
+        validation_alias=AliasChoices("mappings", "pairs", "changes"),
+        min_length=1,
+        description="整批新旧标识对照",
+    )
+
+    model_config = {"populate_by_name": True}
+
+
+class IdentifierMappingOut(BaseModel):
+    old_identifier: str
+    new_identifier: str
+    registered_at: str
+
+
+class IdentifierMappingResponse(BaseModel):
+    status: str = "success"
+    registered: int
+    mappings: list[IdentifierMappingOut]
